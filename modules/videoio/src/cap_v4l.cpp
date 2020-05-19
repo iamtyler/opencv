@@ -309,6 +309,8 @@ static const char* decode_ioctl_code(unsigned long ioctlCode)
     CV_ADD_IOCTL_CODE(VIDIOC_S_INPUT);
     CV_ADD_IOCTL_CODE(VIDIOC_G_CTRL);
     CV_ADD_IOCTL_CODE(VIDIOC_S_CTRL);
+    CV_ADD_IOCTL_CODE(VIDIOC_ENUM_FMT);
+    CV_ADD_IOCTL_CODE(VIDIOC_ENUM_FRAMESIZES);
 #undef CV_ADD_IOCTL_CODE
     }
     return "unknown";
@@ -556,40 +558,102 @@ bool CvCaptureCAM_V4L::autosetup_capture_mode_v4l2()
             return false;
         }
     }
-    __u32 try_order[] = {
-            V4L2_PIX_FMT_BGR24,
-            V4L2_PIX_FMT_RGB24,
-            V4L2_PIX_FMT_YVU420,
-            V4L2_PIX_FMT_YUV420,
-            V4L2_PIX_FMT_YUV411P,
-            V4L2_PIX_FMT_YUYV,
-            V4L2_PIX_FMT_UYVY,
-            V4L2_PIX_FMT_NV12,
-            V4L2_PIX_FMT_NV21,
-            V4L2_PIX_FMT_SBGGR8,
-            V4L2_PIX_FMT_SGBRG8,
-            V4L2_PIX_FMT_SN9C10X,
-#ifdef HAVE_JPEG
-            V4L2_PIX_FMT_MJPEG,
-            V4L2_PIX_FMT_JPEG,
-#endif
-            V4L2_PIX_FMT_Y16,
-            V4L2_PIX_FMT_Y12,
-            V4L2_PIX_FMT_Y10,
-            V4L2_PIX_FMT_GREY,
-    };
 
-    for (size_t i = 0; i < sizeof(try_order) / sizeof(__u32); i++) {
-        palette = try_order[i];
-        if (try_palette_v4l2()) {
-            return true;
-        } else if (errno == EBUSY) {
-            CV_LOG_INFO(NULL, "VIDEOIO(V4L2:" << deviceName << "): device is busy");
-            closeDevice();
-            return false;
+    // Clear palette and track max pixel count
+    __u32 maxPalette = 0;
+    int maxPixels = 0;
+    int maxWidth = 0;
+    int maxHeight = 0;
+
+    // Enumerate formats
+    v4l2_fmtdesc format;
+    format.index = 0;
+    format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    for (;; ++format.index) {
+        if (!tryIoctl(VIDIOC_ENUM_FMT, &format)) {
+            if (errno == EBUSY)
+            {
+                CV_LOG_INFO(NULL, "VIDEOIO(V4L2:" << deviceName << "): device is busy");
+                closeDevice();
+            }
+            if (errno != EINVAL)
+            {
+                return false;
+            }
+            break;
+        }
+
+        // Enumerate frame sizes
+        v4l2_frmsizeenum size;
+        size.index = 0;
+        size.pixel_format = format.pixelformat;
+        for (;; ++size.index) {
+            if (!tryIoctl(VIDIOC_ENUM_FRAMESIZES, &size)) {
+                if (errno == EBUSY)
+                {
+                    CV_LOG_INFO(NULL, "VIDEOIO(V4L2:" << deviceName << "): device is busy");
+                    closeDevice();
+                }
+                if (errno != EINVAL)
+                {
+                    return false;
+                }
+                break;
+            }
+
+            // Only work with discrete frame types
+            if (size.type != V4L2_FRMSIZE_TYPE_DISCRETE)
+            {
+                continue;
+            }
+
+            // Only test types we might use
+            int pixels = size.discrete.width * size.discrete.height;
+            if (pixels <= maxPixels)
+            {
+                continue;
+            }
+
+            // Set palette and frame size in order to test it
+            palette = format.pixelformat;
+            width = size.discrete.width;
+            height = size.discrete.height;
+
+            // Test palette and frame size
+            if (!try_palette_v4l2())
+            {
+                if (errno == EBUSY)
+                {
+                    CV_LOG_INFO(NULL, "VIDEOIO(V4L2:" << deviceName << "): device is busy");
+                    closeDevice();
+                }
+                return false;
+            }
+
+            // Save the new max values
+            maxPixels = pixels;
+            maxPalette = palette;
+            maxWidth = width;
+            maxHeight = height;
         }
     }
-    return false;
+
+    // Revert to default values if no valid settings found
+    if (maxPalette == 0)
+    {
+        palette = 0;
+        width = DEFAULT_V4L_WIDTH;
+        height = DEFAULT_V4L_HEIGHT;
+
+        return false;
+    }
+
+    // Save the discovered values
+    palette = maxPalette;
+    width = maxWidth;
+    height = maxHeight;
+
+    return true;
 }
 
 bool CvCaptureCAM_V4L::setFps(int value)
